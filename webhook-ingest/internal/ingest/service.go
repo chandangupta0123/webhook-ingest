@@ -134,9 +134,4 @@ func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
-	time.Sleep(recordingWork)
-	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
-}
+} 
