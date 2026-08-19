@@ -37,6 +37,9 @@ func (c *Cache) Get(accountID string) AccountStats {
 
 // Record folds one completed call into an account's running totals.
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	s, ok := c.m[accountID]
 	if !ok {
 		s = &AccountStats{}
@@ -44,4 +47,14 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	}
 	s.CallCount++
 	s.TotalDurationSec += int64(durationSec)
+}
+
+// Set replaces the cached totals for an account. It is used when warming the
+// cache from Postgres after a process restart.
+func (c *Cache) Set(accountID string, st AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	copy := st
+	c.m[accountID] = &copy
 }
