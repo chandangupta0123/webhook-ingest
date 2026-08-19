@@ -27,7 +27,7 @@ type Stats struct {
 	CallCount        int64
 	TotalDurationSec int64
 }
-
+ 
 // Store is a Postgres-backed repository.
 type Store struct {
 	pool *pgxpool.Pool
@@ -59,6 +59,8 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 func (s *Store) Close() { s.pool.Close() }
 
 // EventExists reports whether an event with this ID has already been stored.
+// It is retained as a useful repository helper, but ingestion itself does not
+// use it for deduplication because a check followed by an insert is racy.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
 	err := s.pool.QueryRow(ctx,
@@ -72,7 +74,72 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
+// ProcessEvent atomically claims a new event and updates all durable state.
+//
+// The unique event_id constraint is the source of truth for idempotency. The
+// INSERT ... ON CONFLICT statement makes the check-and-insert atomic, so two
+// concurrent deliveries cannot both pass an existence check and increment
+// account statistics.
+//
+// The returned bool is true only when this call inserted a new event and
+// therefore performed the call/statistics updates. A duplicate is a
+// successful no-op and returns false, nil.
+func (s *Store) ProcessEvent(ctx context.Context, e Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var insertedEventID string
+	err = tx.QueryRow(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING event_id`,
+		e.EventID, e.CallID, e.AccountID, e.Payload).Scan(&insertedEventID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Another request already owns this event_id. There is no work to do.
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec)
+	if err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
+	return insertedEventID != "", nil
+}
+
+// InsertEvent stores the raw delivery. It is kept for repository-level tests
+// and simple tooling; normal ingestion should use ProcessEvent.
 func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
@@ -129,3 +196,4 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 	}
 	return st, nil
 }
+ 
