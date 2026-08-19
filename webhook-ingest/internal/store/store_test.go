@@ -39,6 +39,50 @@ func TestInsertEventThenExists(t *testing.T) {
 	}
 }
 
+func TestProcessEventIsIdempotent(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 30, Payload: []byte(`{}`),
+	}
+
+	inserted, err := s.ProcessEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first ProcessEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first ProcessEvent should insert the event")
+	}
+
+	inserted, err = s.ProcessEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("second ProcessEvent: %v", err)
+	}
+	if inserted {
+		t.Fatal("second ProcessEvent should be a duplicate")
+	}
+
+	var eventCount int
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`, eventID).Scan(&eventCount); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("event count = %d, want 1", eventCount)
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 30 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=30", got)
+	}
+}
+
 func TestIncrementAccountStatsAccumulates(t *testing.T) {
 	s := testutil.NewStore(t)
 	_, _, accountID := testutil.IDs(t, s)
