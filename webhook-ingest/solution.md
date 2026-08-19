@@ -1,175 +1,21 @@
 # Solution
 
-## 1. What was broken and why
+## What was broken and why
 
-The service had several correctness and reliability issues in the webhook
-ingestion flow.
+The webhook ingestion flow had a race condition in event deduplication. It checked whether an `event_id` already existed and then inserted it separately. With concurrent or repeated deliveries, two requests could both observe the event as missing and process it, resulting in duplicate calls and incorrect account statistics.
 
-### 1.1 Duplicate webhook deliveries
+The statistics cache also had unsafe concurrent updates. In addition, recording processing depended too much on the request lifecycle, so in-flight recording work could be cancelled during shutdown, and processing failures were not sufficiently visible in logs.
 
-The webhook provider can deliver the same event more than once, while the
-`event_id` remains stable.
+I added regression tests for the affected cases and fixed the underlying concurrency and lifecycle issues.
 
-The original implementation used a check-then-insert flow:
+## Deduplication strategy
 
-1. Check whether `event_id` already exists.
-2. If it does not exist, insert the event.
-3. Update the call and account statistics.
+I chose PostgreSQL for deduplication because it is already the durable source of truth for events, calls, and account statistics. I added a unique constraint on `event_id` and use an atomic `INSERT ... ON CONFLICT DO NOTHING`.
 
-This is vulnerable to a race condition. Two concurrent requests can both
-observe that the event does not exist and both continue processing it.
+I considered Redis, since it is already available, but using Redis as the correctness mechanism would add another state/consistency layer. PostgreSQL already guarantees uniqueness and works correctly across multiple application instances, so this approach is simpler and more reliable. Redis can still be useful later as a performance optimization.
 
-This could result in duplicate event/call records and incorrect account
-statistics.
+## Scaling to 10,000 webhooks/second
 
-### Fix
+At 10,000 webhooks/second, I would separate ingestion from downstream processing using a durable queue or streaming system. The HTTP layer would validate and durably accept events quickly, while horizontally scaled workers would process calls and recordings asynchronously.
 
-I added a PostgreSQL unique index on `events.event_id` and changed event
-insertion to use:
-
-    INSERT ... ON CONFLICT (event_id) DO NOTHING
-
-This makes the database the final authority for event uniqueness and works
-correctly even when multiple service instances receive the same webhook
-concurrently.
-
----
-
-## 2. Transactional consistency
-
-The event, call record, and account statistics represent one logical
-operation.
-
-Previously, these operations could be performed independently. If one
-operation failed after another succeeded, the database could be left in a
-partially updated state.
-
-### Fix
-
-I wrapped the event insertion, call update, and account statistics update
-inside a single PostgreSQL transaction.
-
-The transaction is committed only when all operations succeed. If an
-operation fails, the transaction is rolled back.
-
-This keeps the durable state consistent.
-
----
-
-## 3. Statistics cache concurrency
-
-The in-memory statistics cache can be accessed by multiple HTTP requests
-concurrently.
-
-The cache read path was protected by a read lock, but the write/update path
-was not consistently protected.
-
-### Fix
-
-I protected cache updates using the existing mutex.
-
-This prevents concurrent goroutines from modifying the same map and
-statistics structure unsafely.
-
----
-
-## 4. Recording processing
-
-Recording processing was performed asynchronously after receiving the
-webhook.
-
-The original background work could depend on the HTTP request context.
-Once the request completed or was cancelled, the background operation could
-also be cancelled.
-
-Errors from recording processing were also not useful to operators because
-they were not properly logged.
-
-### Fix
-
-Recording processing now uses its own timeout-based background context.
-
-Recording failures are logged with useful identifiers such as event ID,
-call ID, and account ID.
-
-Background recording work is also tracked so graceful shutdown can wait for
-in-flight work.
-
----
-
-## 5. Deduplication strategy
-
-I chose PostgreSQL as the source of truth for deduplication.
-
-The service already stores events, calls, and account statistics in
-PostgreSQL. Using a PostgreSQL uniqueness constraint means correctness
-does not depend on in-memory state or a separate cache.
-
-The unique constraint is:
-
-    UNIQUE(event_id)
-
-and insertion uses:
-
-    ON CONFLICT (event_id) DO NOTHING
-
-Redis can still be useful for caching or reducing database load, but I
-would not make Redis the source of truth for correctness because PostgreSQL
-already owns the durable event state.
-
----
-
-## 6. Testing
-
-I added regression tests for the failure scenarios, including duplicate
-event processing and concurrent statistics cache access.
-
-The tests are intended to demonstrate the problem before the fix and verify
-that the corrected implementation remains correct under the same scenario.
-
-I also used the Go race detector to identify unsafe concurrent access:
-
-    go test -race ./...
-
----
-
-## 7. What I would change at 10,000 webhooks/sec
-
-At much higher traffic, I would separate webhook ingestion from
-downstream processing.
-
-The HTTP endpoint should acknowledge valid events quickly after durable
-acceptance, while asynchronous processing should happen through a durable
-queue or streaming system.
-
-A possible architecture would be:
-
-    Webhook
-       |
-       v
-    HTTP API
-       |
-       v
-    Durable Queue / Stream
-       |
-       +------> Workers
-       |
-       +------> Recording processing
-       |
-       v
-    PostgreSQL
-
-I would also consider:
-
-- Horizontal scaling of webhook servers and workers.
-- Partitioning or ordering by account/event key where required.
-- Database connection-pool tuning.
-- Batch processing where safe.
-- Metrics for webhook throughput, duplicate rate, processing latency,
-  queue depth, and failures.
-- Distributed tracing for debugging production failures.
-- Redis as a performance optimization rather than the correctness layer.
-
-The main principle would remain the same: webhook processing must be
-idempotent and durable even when requests are duplicated or multiple
-instances process events concurrently.
+I would also tune PostgreSQL connection pools, batch database operations where safe, partition work across workers, and add metrics for throughput, duplicate rate, latency, queue depth, and failures.
