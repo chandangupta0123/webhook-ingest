@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -16,12 +17,16 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+const recordingTimeout = 30 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	workers sync.WaitGroup
 }
 
 // New builds a Service.
@@ -33,19 +38,12 @@ func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *S
 func (s *Service) Stats(accountID string) stats.AccountStats {
 	return s.cache.Get(accountID)
 }
+ 
 
-// Ingest stores a delivery and kicks off processing. Processing runs
-// asynchronously so the provider gets a fast acknowledgement.
+// Ingest stores a delivery and kicks off recording processing. Durable event,
+// call, and account-stat changes are committed together. Duplicate event_ids
+// are a successful no-op, which makes provider retries safe.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,31 +59,83 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.ProcessEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
+	// The database transaction is committed before the cache is changed, so a
+	// failed database transaction can never make the in-memory aggregate drift.
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	// Recording work must not depend on the lifetime of the HTTP request. A
+	// deployment using graceful shutdown waits for these workers to finish.
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		s.workers.Add(1)
+		go s.recordRecording(rec)
 	}
 
 	return nil
 }
 
+func (s *Service) recordRecording(rec store.Event) {
+	defer s.workers.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
+	defer cancel()
+
+	if err := s.processRecording(ctx, rec); err != nil {
+		s.log.Error("recording processing failed",
+			"event_id", rec.EventID,
+			"call_id", rec.CallID,
+			"account_id", rec.AccountID,
+			"err", err,
+		)
+		return
+	}
+
+	s.log.Info("recording processed",
+		"event_id", rec.EventID,
+		"call_id", rec.CallID,
+	)
+}
+
+// Shutdown waits for background recording work to finish. The caller should
+// stop accepting new HTTP requests before calling this method.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // processRecording downloads and transcodes the call recording, then marks
 // the call as done.
+func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
+	timer := time.NewTimer(recordingWork)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	time.Sleep(recordingWork)
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
